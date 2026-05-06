@@ -1,5 +1,19 @@
 function(traykeeper_generate_rpc target_name stub_kind out_include_dir out_stub_source)
-    find_program(MIDL_EXECUTABLE midl REQUIRED)
+    file(GLOB windows_sdk_midl_candidates
+        "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/bin/*/x64/midl.exe"
+        "$ENV{ProgramFiles}/Windows Kits/10/bin/*/x64/midl.exe"
+    )
+    list(SORT windows_sdk_midl_candidates COMPARE NATURAL ORDER DESCENDING)
+
+    find_program(MIDL_EXECUTABLE NAMES midl midl.exe)
+
+    if (NOT MIDL_EXECUTABLE AND windows_sdk_midl_candidates)
+        list(GET windows_sdk_midl_candidates 0 MIDL_EXECUTABLE)
+    endif()
+
+    if (NOT MIDL_EXECUTABLE)
+        message(FATAL_ERROR "Could not find midl.exe. Install the Windows SDK or run CMake from a Visual Studio developer environment.")
+    endif()
 
     cmake_path(GET CMAKE_CURRENT_FUNCTION_LIST_DIR PARENT_PATH repo_root)
     set(idl_file "${repo_root}/common/rpc/TrayKeeperControl.idl")
