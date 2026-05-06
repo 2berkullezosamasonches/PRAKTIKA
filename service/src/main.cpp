@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -30,6 +31,28 @@ struct TrayProcess {
 
 std::vector<TrayProcess> g_trayProcesses;
 
+std::filesystem::path GetServiceDirectory() {
+    wchar_t modulePath[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+    return std::filesystem::path(modulePath).parent_path();
+}
+
+void WriteLog(const std::wstring& message) {
+    const std::filesystem::path logPath = GetServiceDirectory() / L"TrayKeeperService.log";
+    std::wofstream log(logPath, std::ios::app);
+    if (log) {
+        SYSTEMTIME time{};
+        GetLocalTime(&time);
+        log << L"[" << time.wYear << L"-" << time.wMonth << L"-" << time.wDay
+            << L" " << time.wHour << L":" << time.wMinute << L":" << time.wSecond
+            << L"] " << message << L"\n";
+    }
+}
+
+void LogLastError(const std::wstring& operation) {
+    WriteLog(operation + L" failed. GetLastError=" + std::to_wstring(GetLastError()));
+}
+
 void SetServiceStatusState(DWORD state, DWORD win32ExitCode = NO_ERROR, DWORD waitHint = 0) {
     g_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
     g_status.dwCurrentState = state;
@@ -49,12 +72,7 @@ void SetServiceStatusState(DWORD state, DWORD win32ExitCode = NO_ERROR, DWORD wa
 }
 
 std::filesystem::path GetTrayAppPath() {
-    wchar_t modulePath[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
-
-    std::filesystem::path path(modulePath);
-    path = path.parent_path() / L"TrayKeeper.exe";
-    return path;
+    return GetServiceDirectory() / L"TrayKeeper.exe";
 }
 
 void RemoveExitedProcessesLocked() {
@@ -87,18 +105,23 @@ bool IsSessionAlreadyStartedLocked(DWORD sessionId) {
 
 bool LaunchTrayForSession(DWORD sessionId) {
     if (sessionId == 0) {
+        WriteLog(L"Skipping session 0");
         return false;
     }
 
     {
         std::lock_guard<std::mutex> lock(g_processesMutex);
         if (IsSessionAlreadyStartedLocked(sessionId)) {
+            WriteLog(L"Tray already started for session " + std::to_wstring(sessionId));
             return true;
         }
     }
 
+    WriteLog(L"Launching tray for session " + std::to_wstring(sessionId));
+
     HANDLE userToken = nullptr;
     if (!WTSQueryUserToken(sessionId, &userToken)) {
+        LogLastError(L"WTSQueryUserToken");
         return false;
     }
 
@@ -113,11 +136,14 @@ bool LaunchTrayForSession(DWORD sessionId) {
     CloseHandle(userToken);
 
     if (!duplicated) {
+        LogLastError(L"DuplicateTokenEx");
         return false;
     }
 
     void* environment = nullptr;
-    CreateEnvironmentBlock(&environment, primaryToken, FALSE);
+    if (!CreateEnvironmentBlock(&environment, primaryToken, FALSE)) {
+        LogLastError(L"CreateEnvironmentBlock");
+    }
 
     const std::filesystem::path appPath = GetTrayAppPath();
     const std::wstring commandLine = L"\"" + appPath.wstring() + L"\" --hidden";
@@ -129,7 +155,7 @@ bool LaunchTrayForSession(DWORD sessionId) {
     startupInfo.lpDesktop = const_cast<LPWSTR>(L"winsta0\\default");
 
     PROCESS_INFORMATION processInfo{};
-    const BOOL created = CreateProcessAsUserW(
+    BOOL created = CreateProcessAsUserW(
         primaryToken,
         appPath.c_str(),
         mutableCommandLine.data(),
@@ -142,6 +168,24 @@ bool LaunchTrayForSession(DWORD sessionId) {
         &startupInfo,
         &processInfo);
 
+    if (!created) {
+        LogLastError(L"CreateProcessAsUserW");
+        created = CreateProcessWithTokenW(
+            primaryToken,
+            LOGON_WITH_PROFILE,
+            appPath.c_str(),
+            mutableCommandLine.data(),
+            CREATE_UNICODE_ENVIRONMENT,
+            environment,
+            appPath.parent_path().c_str(),
+            &startupInfo,
+            &processInfo);
+
+        if (!created) {
+            LogLastError(L"CreateProcessWithTokenW");
+        }
+    }
+
     if (environment) {
         DestroyEnvironmentBlock(environment);
     }
@@ -153,6 +197,8 @@ bool LaunchTrayForSession(DWORD sessionId) {
 
     std::lock_guard<std::mutex> lock(g_processesMutex);
     g_trayProcesses.push_back({ sessionId, processInfo });
+    WriteLog(L"Started TrayKeeper.exe pid " + std::to_wstring(processInfo.dwProcessId) +
+        L" for session " + std::to_wstring(sessionId));
     return true;
 }
 
@@ -161,10 +207,13 @@ void LaunchTrayForAllLoggedOnSessions() {
     DWORD sessionCount = 0;
 
     if (!WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &sessions, &sessionCount)) {
+        LogLastError(L"WTSEnumerateSessionsW");
         return;
     }
 
     for (DWORD i = 0; i < sessionCount; ++i) {
+        WriteLog(L"Found session " + std::to_wstring(sessions[i].SessionId) +
+            L" state " + std::to_wstring(sessions[i].State));
         if (sessions[i].SessionId != 0 &&
             (sessions[i].State == WTSActive || sessions[i].State == WTSConnected)) {
             LaunchTrayForSession(sessions[i].SessionId);

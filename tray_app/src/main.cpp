@@ -129,7 +129,7 @@ bool StartServiceIfStoppedAndExit() {
         return true;
     }
 
-    SC_HANDLE service = OpenServiceW(manager, kServiceName, SERVICE_QUERY_STATUS | SERVICE_START);
+    SC_HANDLE service = OpenServiceW(manager, kServiceName, SERVICE_QUERY_STATUS);
     if (!service) {
         CloseServiceHandle(manager);
         return true;
@@ -144,13 +144,21 @@ bool StartServiceIfStoppedAndExit() {
 
     bool shouldExit = false;
     if (state == SERVICE_STOPPED) {
-        if (StartServiceW(service, 0, nullptr) || GetLastError() == ERROR_SERVICE_ALREADY_RUNNING) {
-            WaitForServiceState(service, SERVICE_RUNNING, 30000);
+        CloseServiceHandle(service);
+        service = OpenServiceW(manager, kServiceName, SERVICE_QUERY_STATUS | SERVICE_START);
+
+        if (service) {
+            if (StartServiceW(service, 0, nullptr) || GetLastError() == ERROR_SERVICE_ALREADY_RUNNING) {
+                WaitForServiceState(service, SERVICE_RUNNING, 30000);
+            }
         }
+
         shouldExit = true;
     }
 
-    CloseServiceHandle(service);
+    if (service) {
+        CloseServiceHandle(service);
+    }
     CloseServiceHandle(manager);
     return shouldExit;
 }
@@ -184,23 +192,36 @@ bool IsParentServiceProcess() {
         return false;
     }
 
-    HANDLE parentProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parentProcessId);
-    if (!parentProcess) {
+    SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!manager) {
         return false;
     }
 
-    std::vector<wchar_t> imagePath(MAX_PATH);
-    DWORD size = static_cast<DWORD>(imagePath.size());
-
-    if (!QueryFullProcessImageNameW(parentProcess, 0, imagePath.data(), &size)) {
-        CloseHandle(parentProcess);
+    SC_HANDLE service = OpenServiceW(manager, kServiceName, SERVICE_QUERY_STATUS);
+    if (!service) {
+        CloseServiceHandle(manager);
         return false;
     }
 
-    CloseHandle(parentProcess);
+    SERVICE_STATUS_PROCESS status{};
+    DWORD bytesNeeded = 0;
+    const BOOL queried = QueryServiceStatusEx(
+        service,
+        SC_STATUS_PROCESS_INFO,
+        reinterpret_cast<LPBYTE>(&status),
+        sizeof(status),
+        &bytesNeeded);
 
-    const std::filesystem::path parentPath(std::wstring(imagePath.data(), size));
-    return EqualsIgnoreCase(parentPath.filename().wstring(), kServiceProcessName);
+    CloseServiceHandle(service);
+    CloseServiceHandle(manager);
+
+    if (!queried) {
+        return false;
+    }
+
+    return status.dwCurrentState == SERVICE_RUNNING &&
+        status.dwProcessId != 0 &&
+        parentProcessId == status.dwProcessId;
 }
 
 bool RequestServiceStopViaRpc() {
