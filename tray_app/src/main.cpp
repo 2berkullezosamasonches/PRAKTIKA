@@ -1,18 +1,27 @@
 #include <windows.h>
+#include <rpc.h>
 #include <shellapi.h>
 #include <strsafe.h>
+#include <tlhelp32.h>
 
 #include <cstdlib>
 #include <cwchar>
+#include <filesystem>
 #include <iterator>
 #include <string>
+#include <vector>
 
 #include "resource.h"
+#include "TrayKeeperControl.h"
 
 namespace {
 
 constexpr wchar_t kWindowClassName[] = L"TrayAppWindowClass";
 constexpr wchar_t kWindowTitle[] = L"Tray Keeper";
+constexpr wchar_t kServiceName[] = L"TrayKeeperService";
+constexpr wchar_t kServiceProcessName[] = L"TrayKeeperService.exe";
+constexpr wchar_t kRpcProtocol[] = L"ncalrpc";
+constexpr wchar_t kRpcEndpoint[] = L"TrayKeeperControlAlpc";
 constexpr UINT kTrayCallbackMessage = WM_APP + 1;
 constexpr UINT kTrayIconId = 1;
 
@@ -22,6 +31,10 @@ UINT g_taskbarCreatedMessage = 0;
 NOTIFYICONDATAW g_trayIconData{};
 bool g_trayIconAdded = false;
 bool g_isQuitting = false;
+
+bool EqualsIgnoreCase(const std::wstring& left, const std::wstring& right) {
+    return _wcsicmp(left.c_str(), right.c_str()) == 0;
+}
 
 std::wstring GetLastErrorText(DWORD errorCode) {
     if (errorCode == 0) {
@@ -74,6 +87,157 @@ bool HasHiddenModeFlag() {
     return false;
 }
 
+bool QueryServiceState(SC_HANDLE service, DWORD& state) {
+    SERVICE_STATUS_PROCESS status{};
+    DWORD bytesNeeded = 0;
+
+    if (!QueryServiceStatusEx(
+            service,
+            SC_STATUS_PROCESS_INFO,
+            reinterpret_cast<LPBYTE>(&status),
+            sizeof(status),
+            &bytesNeeded)) {
+        return false;
+    }
+
+    state = status.dwCurrentState;
+    return true;
+}
+
+bool WaitForServiceState(SC_HANDLE service, DWORD expectedState, DWORD timeoutMs) {
+    const DWORD startedAt = GetTickCount();
+
+    while (GetTickCount() - startedAt < timeoutMs) {
+        DWORD state = 0;
+        if (!QueryServiceState(service, state)) {
+            return false;
+        }
+
+        if (state == expectedState) {
+            return true;
+        }
+
+        Sleep(300);
+    }
+
+    return false;
+}
+
+bool StartServiceIfStoppedAndExit() {
+    SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!manager) {
+        return true;
+    }
+
+    SC_HANDLE service = OpenServiceW(manager, kServiceName, SERVICE_QUERY_STATUS | SERVICE_START);
+    if (!service) {
+        CloseServiceHandle(manager);
+        return true;
+    }
+
+    DWORD state = 0;
+    if (!QueryServiceState(service, state)) {
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+        return true;
+    }
+
+    bool shouldExit = false;
+    if (state == SERVICE_STOPPED) {
+        if (StartServiceW(service, 0, nullptr) || GetLastError() == ERROR_SERVICE_ALREADY_RUNNING) {
+            WaitForServiceState(service, SERVICE_RUNNING, 30000);
+        }
+        shouldExit = true;
+    }
+
+    CloseServiceHandle(service);
+    CloseServiceHandle(manager);
+    return shouldExit;
+}
+
+DWORD GetParentProcessId(DWORD processId) {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+
+    DWORD parentProcessId = 0;
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (entry.th32ProcessID == processId) {
+                parentProcessId = entry.th32ParentProcessID;
+                break;
+            }
+        } while (Process32NextW(snapshot, &entry));
+    }
+
+    CloseHandle(snapshot);
+    return parentProcessId;
+}
+
+bool IsParentServiceProcess() {
+    const DWORD parentProcessId = GetParentProcessId(GetCurrentProcessId());
+    if (parentProcessId == 0) {
+        return false;
+    }
+
+    HANDLE parentProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parentProcessId);
+    if (!parentProcess) {
+        return false;
+    }
+
+    std::vector<wchar_t> imagePath(MAX_PATH);
+    DWORD size = static_cast<DWORD>(imagePath.size());
+
+    if (!QueryFullProcessImageNameW(parentProcess, 0, imagePath.data(), &size)) {
+        CloseHandle(parentProcess);
+        return false;
+    }
+
+    CloseHandle(parentProcess);
+
+    const std::filesystem::path parentPath(std::wstring(imagePath.data(), size));
+    return EqualsIgnoreCase(parentPath.filename().wstring(), kServiceProcessName);
+}
+
+bool RequestServiceStopViaRpc() {
+    RPC_WSTR stringBinding = nullptr;
+    RPC_STATUS status = RpcStringBindingComposeW(
+        nullptr,
+        reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(kRpcProtocol)),
+        nullptr,
+        reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(kRpcEndpoint)),
+        nullptr,
+        &stringBinding);
+
+    if (status != RPC_S_OK) {
+        return false;
+    }
+
+    status = RpcBindingFromStringBindingW(stringBinding, &TrayKeeperControlBinding);
+    RpcStringFreeW(&stringBinding);
+
+    if (status != RPC_S_OK) {
+        return false;
+    }
+
+    bool stopped = false;
+    RpcTryExcept {
+        TrayKeeperStopService();
+        stopped = true;
+    }
+    RpcExcept(1) {
+        stopped = false;
+    }
+    RpcEndExcept
+
+    RpcBindingFree(&TrayKeeperControlBinding);
+    return stopped;
+}
+
 void ShowMainWindow(HWND hwnd) {
     ShowWindow(hwnd, SW_SHOWNORMAL);
     SetForegroundWindow(hwnd);
@@ -116,6 +280,12 @@ void QuitApplication(HWND hwnd) {
     g_isQuitting = true;
     RemoveTrayIcon();
     DestroyWindow(hwnd);
+}
+
+void StopServiceFromUi(HWND hwnd) {
+    if (!RequestServiceStopViaRpc()) {
+        MessageBoxW(hwnd, L"Не удалось отправить команду остановки службе.", kWindowTitle, MB_ICONERROR);
+    }
 }
 
 void ShowTrayContextMenu(HWND hwnd) {
@@ -261,7 +431,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         switch (LOWORD(wParam)) {
         case IDM_FILE_EXIT:
         case IDM_TRAY_EXIT:
-            QuitApplication(hwnd);
+            StopServiceFromUi(hwnd);
             return 0;
         case IDM_TRAY_OPEN:
             ShowMainWindow(hwnd);
@@ -309,7 +479,27 @@ bool RegisterMainWindowClass(HINSTANCE instance) {
 
 } // namespace
 
+extern "C" {
+handle_t TrayKeeperControlBinding = nullptr;
+}
+
+extern "C" void* __RPC_USER midl_user_allocate(size_t size) {
+    return std::malloc(size);
+}
+
+extern "C" void __RPC_USER midl_user_free(void* pointer) {
+    std::free(pointer);
+}
+
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int commandShow) {
+    if (StartServiceIfStoppedAndExit()) {
+        return 0;
+    }
+
+    if (!IsParentServiceProcess()) {
+        return 0;
+    }
+
     const std::wstring mutexName = BuildUserMutexName();
     HANDLE singleInstanceMutex = CreateMutexW(nullptr, TRUE, mutexName.c_str());
 

@@ -35,22 +35,25 @@
 Команды:
 
 ```powershell
-cd tray_app
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 ```
 
-Готовый файл будет здесь:
+Готовые файлы будут здесь:
 
 ```text
-tray_app/build/Release/TrayKeeper.exe
+build/bin/Release/TrayKeeper.exe
+build/bin/Release/TrayKeeperService.exe
 ```
 
-Запуск в фоновом режиме без главного окна:
+Установка службы для проверки задания 2:
 
 ```powershell
-.\build\Release\TrayKeeper.exe --hidden
+New-Service -Name TrayKeeperService -BinaryPathName "$PWD\build\bin\Release\TrayKeeperService.exe" -StartupType Manual
+Start-Service TrayKeeperService
 ```
+
+После запуска службы `TrayKeeper.exe` стартует в пользовательских сессиях скрыто, от имени владельца сессии. Пункты `Файл -> Выход` и `Выход` в меню трея отправляют RPC-команду остановки службы.
 
 ## Как сдавать
 
