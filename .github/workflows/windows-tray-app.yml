@@ -1,0 +1,27 @@
+name: Build Windows Tray App
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -S tray_app -B tray_app/build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build tray_app/build --config Release
+
+      - name: Upload executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrayKeeper-exe
+          path: tray_app/build/Release/*.exe
