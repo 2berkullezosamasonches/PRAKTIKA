@@ -1,0 +1,8 @@
+.vs/
+out/
+build/
+build-ninja/
+tray_app/out/
+tray_app/build/
+service/out/
+service/build/
