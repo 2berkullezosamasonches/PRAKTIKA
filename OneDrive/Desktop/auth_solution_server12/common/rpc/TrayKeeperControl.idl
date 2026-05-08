@@ -1,0 +1,33 @@
+[
+    uuid(9f0c7a24-135e-4d33-9e90-872f2e5f8151),
+    version(1.0),
+    implicit_handle(handle_t TrayKeeperControlBinding)
+]
+interface TrayKeeperControl
+{
+    void TrayKeeperStopService();
+
+    long TrayKeeperGetCurrentUser(
+        [out] long* authenticated,
+        [out, string] wchar_t** username,
+        [out, string] wchar_t** errorMessage);
+
+    long TrayKeeperLogin(
+        [in, string] wchar_t* username,
+        [in, string] wchar_t* password,
+        [out, string] wchar_t** errorMessage);
+
+    long TrayKeeperLogout([out, string] wchar_t** errorMessage);
+
+    long TrayKeeperGetLicenseInfo(
+        [out] long* hasLicense,
+        [out] long* antivirusAllowed,
+        [out, string] wchar_t** endingDate,
+        [out, string] wchar_t** errorMessage);
+
+    long TrayKeeperActivateProduct(
+        [in, string] wchar_t* activationCode,
+        [out, string] wchar_t** errorMessage);
+
+    long TrayKeeperCheckAntivirusAccess([out, string] wchar_t** errorMessage);
+}
