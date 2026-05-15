@@ -114,6 +114,7 @@ struct AuthState {
 std::vector<TrayProcess> g_trayProcesses;
 AuthState g_authState;
 AvDatabaseState g_avDatabase;
+std::chrono::system_clock::time_point g_nextAvDatabaseUpdateAt{};
 
 std::mutex g_monitorMutex;
 std::thread g_monitorThread;
@@ -384,17 +385,339 @@ void ClearAvDatabaseLocked(const std::wstring& message = L"Антивирусн�
     g_avDatabase.message = message;
 }
 
-void LoadAvDatabaseLocked() {
+
+std::vector<AvRecord> BuildDefaultAvRecords() {
+    std::vector<AvRecord> records;
+    records.push_back(MakeAvRecord("Training.Script.EICAR", "EICAR-STANDARD-ANTIVIRUS-TEST-FILE", 0, 4096, TK_OBJECT_PYTHON_SCRIPT));
+    records.push_back(MakeAvRecord("Training.JavaScript.EICAR", "EICAR-STANDARD-ANTIVIRUS-TEST-FILE", 0, 4096, TK_OBJECT_JAVASCRIPT));
+    records.push_back(MakeAvRecord("Training.PE.Marker", "MZTRAYKEEPER-TRAINING-MALWARE", 0, 1024, TK_OBJECT_PE));
+    return records;
+}
+
+std::filesystem::path GetAvDatabaseDirectory() {
+    return GetServiceDirectory() / L"avdb";
+}
+
+std::filesystem::path GetActiveAvDatabasePath() {
+    return GetAvDatabaseDirectory() / L"active.tkavdb";
+}
+
+std::filesystem::path GetBackupAvDatabasePath() {
+    return GetAvDatabaseDirectory() / L"backup.tkavdb";
+}
+
+std::filesystem::path GetDefaultAvDatabasePath() {
+    return GetAvDatabaseDirectory() / L"default.tkavdb";
+}
+
+void AppendBytes(std::vector<uint8_t>& target, const std::vector<uint8_t>& value) {
+    target.insert(target.end(), value.begin(), value.end());
+}
+
+void AppendUInt8(std::vector<uint8_t>& target, uint8_t value) {
+    target.push_back(value);
+}
+
+void AppendStringUtf8(std::vector<uint8_t>& target, const std::wstring& value) {
+    const std::string utf8 = WideToUtf8(value);
+    AppendUInt32(target, static_cast<uint32_t>(utf8.size()));
+    target.insert(target.end(), utf8.begin(), utf8.end());
+}
+
+bool ReadUInt8(const std::vector<uint8_t>& data, size_t& pos, uint8_t& value) {
+    if (pos + 1 > data.size()) return false;
+    value = data[pos++];
+    return true;
+}
+
+bool ReadUInt32(const std::vector<uint8_t>& data, size_t& pos, uint32_t& value) {
+    if (pos + 4 > data.size()) return false;
+    value = 0;
+    for (int i = 0; i < 4; ++i) value |= static_cast<uint32_t>(data[pos++]) << (i * 8);
+    return true;
+}
+
+bool ReadUInt64(const std::vector<uint8_t>& data, size_t& pos, uint64_t& value) {
+    if (pos + 8 > data.size()) return false;
+    value = 0;
+    for (int i = 0; i < 8; ++i) value |= static_cast<uint64_t>(data[pos++]) << (i * 8);
+    return true;
+}
+
+bool ReadBytes(const std::vector<uint8_t>& data, size_t& pos, uint32_t size, std::vector<uint8_t>& value) {
+    if (pos + size > data.size()) return false;
+    value.assign(data.begin() + static_cast<ptrdiff_t>(pos), data.begin() + static_cast<ptrdiff_t>(pos + size));
+    pos += size;
+    return true;
+}
+
+bool ReadStringUtf8(const std::vector<uint8_t>& data, size_t& pos, std::wstring& value) {
+    uint32_t size = 0;
+    if (!ReadUInt32(data, pos, size)) return false;
+    if (size > 4096 || pos + size > data.size()) return false;
+    std::string utf8(data.begin() + static_cast<ptrdiff_t>(pos), data.begin() + static_cast<ptrdiff_t>(pos + size));
+    pos += size;
+    value = Utf8ToWide(utf8);
+    return true;
+}
+
+std::vector<uint8_t> SerializeRecordPayload(const AvRecord& record) {
+    std::vector<uint8_t> data;
+    AppendUInt64(data, record.objectSignaturePrefix);
+    AppendUInt32(data, record.objectSignatureLength);
+    AppendUInt32(data, static_cast<uint32_t>(record.objectSignature.size()));
+    AppendBytes(data, record.objectSignature);
+    AppendUInt64(data, record.offsetBegin);
+    AppendUInt64(data, record.offsetEnd);
+    AppendUInt8(data, record.objectType);
+    AppendStringUtf8(data, record.name);
+    return data;
+}
+
+std::vector<uint8_t> SerializeRecordWithSignature(const AvRecord& record) {
+    std::vector<uint8_t> data = SerializeRecordPayload(record);
+    AppendUInt32(data, static_cast<uint32_t>(record.avRecordSignature.size()));
+    AppendBytes(data, record.avRecordSignature);
+    return data;
+}
+
+uint64_t ComputeManifestSignature(uint32_t version, uint64_t releaseUnix, uint32_t recordCount, uint64_t recordsHash) {
+    std::vector<uint8_t> data;
+    const char magic[8] = {'T','K','A','V','D','B','1','\0'};
+    data.insert(data.end(), magic, magic + 8);
+    AppendUInt32(data, version);
+    AppendUInt64(data, releaseUnix);
+    AppendUInt32(data, recordCount);
+    AppendUInt64(data, recordsHash);
+    const char key[] = "TrayKeeperTrainingManifestSignatureKey";
+    data.insert(data.end(), key, key + strlen(key));
+    return Fnva64(data.data(), data.size());
+}
+
+uint64_t CurrentUnixTime() {
+    return static_cast<uint64_t>(std::time(nullptr));
+}
+
+std::wstring FormatUnixDate(uint64_t unixTime) {
+    std::time_t value = static_cast<std::time_t>(unixTime);
+    std::tm tmValue{};
+    localtime_s(&tmValue, &value);
+    wchar_t buffer[32]{};
+    StringCchPrintfW(buffer, std::size(buffer), L"%04d-%02d-%02d", tmValue.tm_year + 1900, tmValue.tm_mon + 1, tmValue.tm_mday);
+    return buffer;
+}
+
+bool WriteAvDatabaseFile(const std::filesystem::path& path, const std::vector<AvRecord>& records, uint64_t releaseUnix) {
+    try {
+        std::filesystem::create_directories(path.parent_path());
+        std::vector<uint8_t> recordsPayload;
+        for (const AvRecord& record : records) {
+            AppendBytes(recordsPayload, SerializeRecordWithSignature(record));
+        }
+
+        constexpr uint32_t version = 1;
+        const uint32_t recordCount = static_cast<uint32_t>(records.size());
+        const uint64_t recordsHash = Fnva64(recordsPayload.data(), recordsPayload.size());
+        const uint64_t manifestSignature = ComputeManifestSignature(version, releaseUnix, recordCount, recordsHash);
+
+        std::vector<uint8_t> file;
+        const char magic[8] = {'T','K','A','V','D','B','1','\0'};
+        file.insert(file.end(), magic, magic + 8);
+        AppendUInt32(file, version);
+        AppendUInt64(file, releaseUnix);
+        AppendUInt32(file, recordCount);
+        AppendUInt64(file, recordsHash);
+        AppendUInt64(file, manifestSignature);
+        AppendBytes(file, recordsPayload);
+
+        std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+        if (!stream) return false;
+        stream.write(reinterpret_cast<const char*>(file.data()), static_cast<std::streamsize>(file.size()));
+        return static_cast<bool>(stream);
+    } catch (...) {
+        return false;
+    }
+}
+
+bool LoadAvDatabaseFileLocked(const std::filesystem::path& path, const std::wstring& sourceMessage) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) return false;
+    std::vector<uint8_t> data((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+    if (data.size() < 40) return false;
+
+    size_t pos = 0;
+    const char expectedMagic[8] = {'T','K','A','V','D','B','1','\0'};
+    if (memcmp(data.data(), expectedMagic, 8) != 0) return false;
+    pos += 8;
+
+    uint32_t version = 0;
+    uint64_t releaseUnix = 0;
+    uint32_t recordCount = 0;
+    uint64_t recordsHash = 0;
+    uint64_t manifestSignature = 0;
+    if (!ReadUInt32(data, pos, version) || !ReadUInt64(data, pos, releaseUnix) || !ReadUInt32(data, pos, recordCount) ||
+        !ReadUInt64(data, pos, recordsHash) || !ReadUInt64(data, pos, manifestSignature)) {
+        return false;
+    }
+    if (version != 1 || recordCount > 100000) return false;
+
+    const uint64_t expectedManifestSignature = ComputeManifestSignature(version, releaseUnix, recordCount, recordsHash);
+    if (manifestSignature != expectedManifestSignature) {
+        WriteLog(L"AV database manifest signature verification failed: " + path.wstring());
+        return false;
+    }
+
+    const size_t recordsStart = pos;
+    const uint64_t actualRecordsHash = Fnva64(data.data() + recordsStart, data.size() - recordsStart);
+    if (actualRecordsHash != recordsHash) {
+        // The manifest-level integrity hash is checked and logged, but corrupted
+        // record payloads are still parsed so that per-record EDS verification can
+        // skip only bad records and keep the rest of the AV database available.
+        WriteLog(L"AV database records hash mismatch; validating records individually: " + path.wstring());
+    }
+
+    AvDatabaseState loaded;
+    loaded.loaded = true;
+    loaded.releaseDate = FormatUnixDate(releaseUnix);
+    loaded.message = sourceMessage;
+
+    for (uint32_t i = 0; i < recordCount; ++i) {
+        AvRecord record;
+        uint32_t signatureHashSize = 0;
+        uint32_t recordSignatureSize = 0;
+        if (!ReadUInt64(data, pos, record.objectSignaturePrefix) ||
+            !ReadUInt32(data, pos, record.objectSignatureLength) ||
+            !ReadUInt32(data, pos, signatureHashSize) ||
+            !ReadBytes(data, pos, signatureHashSize, record.objectSignature) ||
+            !ReadUInt64(data, pos, record.offsetBegin) ||
+            !ReadUInt64(data, pos, record.offsetEnd) ||
+            !ReadUInt8(data, pos, record.objectType) ||
+            !ReadStringUtf8(data, pos, record.name) ||
+            !ReadUInt32(data, pos, recordSignatureSize) ||
+            !ReadBytes(data, pos, recordSignatureSize, record.avRecordSignature)) {
+            WriteLog(L"AV database record parse failed, loading stopped: " + path.wstring());
+            break;
+        }
+
+        if (record.avRecordSignature != SignRecordForTraining(record)) {
+            WriteLog(L"AV database record signature verification failed; record skipped: " + record.name);
+            continue;
+        }
+        loaded.records[record.objectSignaturePrefix].push_back(record);
+        ++loaded.recordCount;
+    }
+
+    g_avDatabase = std::move(loaded);
+    g_nextAvDatabaseUpdateAt = std::chrono::system_clock::now() + std::chrono::minutes(1);
+    return g_avDatabase.recordCount > 0;
+}
+
+bool BackupActiveAvDatabase() {
+    try {
+        const auto active = GetActiveAvDatabasePath();
+        const auto backup = GetBackupAvDatabasePath();
+        if (!std::filesystem::exists(active)) return true;
+        std::filesystem::create_directories(backup.parent_path());
+        std::filesystem::copy_file(active, backup, std::filesystem::copy_options::overwrite_existing);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool RestoreAvDatabaseBackup() {
+    try {
+        const auto active = GetActiveAvDatabasePath();
+        const auto backup = GetBackupAvDatabasePath();
+        if (!std::filesystem::exists(backup)) return false;
+        std::filesystem::copy_file(backup, active, std::filesystem::copy_options::overwrite_existing);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool EnsureDefaultAvDatabaseFile() {
+    const auto defaultPath = GetDefaultAvDatabasePath();
+    if (std::filesystem::exists(defaultPath)) return true;
+    return WriteAvDatabaseFile(defaultPath, BuildDefaultAvRecords(), CurrentUnixTime());
+}
+
+bool HasNetworkAccessForAvUpdate() {
+    // Учебная проверка доступности сети: сервер лицензирования уже используется службой через HTTPS.
+    // Если пользователь вошёл и есть Access Token, считаем, что можно выполнить принудительное обновление базы.
+    return g_authState.authenticated && !g_authState.accessToken.empty();
+}
+
+bool WriteUpdatedAvDatabaseFromTrainingProvider() {
+    // В учебном проекте нет отдельного эндпоинта обновлений AV-баз, поэтому обновление моделируется
+    // локальным поставщиком: создаётся новая подписанная бинарная база в том же формате.
+    std::vector<AvRecord> records = BuildDefaultAvRecords();
+    records.push_back(MakeAvRecord("Training.PowerShell.EICAR", "EICAR-STANDARD-ANTIVIRUS-TEST-FILE", 0, 4096, TK_OBJECT_PYTHON_SCRIPT));
+    return WriteAvDatabaseFile(GetActiveAvDatabasePath(), records, CurrentUnixTime());
+}
+
+bool LoadDefaultAvDatabaseLocked() {
+    EnsureDefaultAvDatabaseFile();
+    if (LoadAvDatabaseFileLocked(GetDefaultAvDatabasePath(), L"Загружены антивирусные базы по умолчанию")) {
+        try { std::filesystem::copy_file(GetDefaultAvDatabasePath(), GetActiveAvDatabasePath(), std::filesystem::copy_options::overwrite_existing); } catch (...) {}
+        return true;
+    }
+
     ClearAvDatabaseLocked();
     g_avDatabase.loaded = true;
     g_avDatabase.releaseDate = FormatCurrentDate();
-    g_avDatabase.message = L"Антивирусные базы загружены в оперативную память";
+    g_avDatabase.message = L"Загружены встроенные антивирусные базы по умолчанию";
+    for (const AvRecord& record : BuildDefaultAvRecords()) AddAvRecordLocked(record);
+    g_nextAvDatabaseUpdateAt = std::chrono::system_clock::now() + std::chrono::minutes(1);
+    return true;
+}
 
-    // Учебные записи. База не хранится на диске: записи создаются в памяти после успешной лицензии.
-    // Для проверки можно создать .py/.js файл со строкой EICAR-STANDARD-ANTIVIRUS-TEST-FILE.
-    AddAvRecordLocked(MakeAvRecord("Training.Script.EICAR", "EICAR-STANDARD-ANTIVIRUS-TEST-FILE", 0, 4096, TK_OBJECT_PYTHON_SCRIPT));
-    AddAvRecordLocked(MakeAvRecord("Training.JavaScript.EICAR", "EICAR-STANDARD-ANTIVIRUS-TEST-FILE", 0, 4096, TK_OBJECT_JAVASCRIPT));
-    AddAvRecordLocked(MakeAvRecord("Training.PE.Marker", "MZTRAYKEEPER-TRAINING-MALWARE", 0, 1024, TK_OBJECT_PE));
+bool LoadAvDatabaseFromDiskOrRecoveryLocked() {
+    ClearAvDatabaseLocked(L"Антивирусные базы загружаются с диска");
+    EnsureDefaultAvDatabaseFile();
+
+    if (LoadAvDatabaseFileLocked(GetActiveAvDatabasePath(), L"Антивирусные базы загружены с диска")) {
+        return true;
+    }
+
+    if (HasNetworkAccessForAvUpdate()) {
+        WriteLog(L"Active AV database is invalid. Trying forced update because network/auth is available.");
+        BackupActiveAvDatabase();
+        if (WriteUpdatedAvDatabaseFromTrainingProvider() && LoadAvDatabaseFileLocked(GetActiveAvDatabasePath(), L"Антивирусные базы принудительно обновлены после ошибки проверки")) {
+            return true;
+        }
+    }
+
+    if (RestoreAvDatabaseBackup() && LoadAvDatabaseFileLocked(GetActiveAvDatabasePath(), L"Антивирусные базы восстановлены из резервной копии")) {
+        return true;
+    }
+
+    return LoadDefaultAvDatabaseLocked();
+}
+
+void LoadAvDatabaseLocked() {
+    LoadAvDatabaseFromDiskOrRecoveryLocked();
+}
+
+bool UpdateAvDatabaseFromSchedule() {
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    if (!g_authState.authenticated || !g_authState.license.active) return false;
+
+    WriteLog(L"Scheduled AV database update started.");
+    BackupActiveAvDatabase();
+    if (WriteUpdatedAvDatabaseFromTrainingProvider() && LoadAvDatabaseFileLocked(GetActiveAvDatabasePath(), L"Антивирусные базы обновлены по расписанию")) {
+        WriteLog(L"Scheduled AV database update completed.");
+        return true;
+    }
+
+    WriteLog(L"Scheduled AV database update failed. Rolling back from backup.");
+    if (RestoreAvDatabaseBackup() && LoadAvDatabaseFileLocked(GetActiveAvDatabasePath(), L"Антивирусные базы восстановлены после ошибки обновления")) {
+        return false;
+    }
+
+    LoadDefaultAvDatabaseLocked();
+    return false;
 }
 
 std::wstring ToLowerCopy(std::wstring value) {
@@ -701,16 +1024,19 @@ void RefreshWorker() {
     while (WaitForSingleObject(g_stopEvent, 5000) == WAIT_TIMEOUT) {
         bool shouldRefreshToken = false;
         bool shouldRefreshLicense = false;
+        bool shouldUpdateAvDatabase = false;
         {
             std::lock_guard<std::mutex> lock(g_stateMutex);
             if (!g_authState.authenticated) continue;
             const auto now = std::chrono::system_clock::now();
             shouldRefreshToken = g_authState.accessExpiresAt.time_since_epoch().count() != 0 && now + std::chrono::seconds(60) >= g_authState.accessExpiresAt;
             shouldRefreshLicense = g_authState.license.active && g_authState.license.refreshAt.time_since_epoch().count() != 0 && now >= g_authState.license.refreshAt;
+            shouldUpdateAvDatabase = g_authState.license.active && g_nextAvDatabaseUpdateAt.time_since_epoch().count() != 0 && now >= g_nextAvDatabaseUpdateAt;
         }
 
         if (shouldRefreshToken) RefreshTokens();
         if (shouldRefreshLicense) CheckLicenseNow();
+        if (shouldUpdateAvDatabase) UpdateAvDatabaseFromSchedule();
     }
 }
 
