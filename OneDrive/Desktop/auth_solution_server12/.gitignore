@@ -6,3 +6,12 @@ tray_app/out/
 tray_app/build/
 service/out/
 service/build/
+installer-output/
+installer-payload/
+*.iss.tmp
+
+# Installer generated payload
+installer/payload/
+build/installer/
+build/installer-payload/
+

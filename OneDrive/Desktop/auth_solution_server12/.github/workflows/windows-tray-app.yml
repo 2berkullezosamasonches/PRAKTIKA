@@ -20,8 +20,49 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
+      - name: Prepare installer payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $payload = Join-Path $env:GITHUB_WORKSPACE 'build/installer-payload'
+          New-Item -ItemType Directory -Force -Path $payload | Out-Null
+
+          Copy-Item 'build/bin/Release/TrayKeeper.exe' $payload -Force
+          Copy-Item 'build/bin/Release/TrayKeeperService.exe' $payload -Force
+
+          Get-ChildItem 'build/bin/Release' -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.dll', '.json', '.config' } | ForEach-Object {
+            Copy-Item $_.FullName $payload -Force
+          }
+
+          $avdb = Join-Path $payload 'avdb'
+          New-Item -ItemType Directory -Force -Path $avdb | Out-Null
+          Copy-Item 'installer/assets/avdb/default.tkavdb' (Join-Path $avdb 'default.tkavdb') -Force
+          Copy-Item 'installer/assets/avdb/default.tkavdb' (Join-Path $avdb 'active.tkavdb') -Force
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
+          $payload = Join-Path $env:GITHUB_WORKSPACE 'build/installer-payload'
+          $output = Join-Path $env:GITHUB_WORKSPACE 'build/installer'
+          New-Item -ItemType Directory -Force -Path $output | Out-Null
+          & $iscc "/DSourceDir=$payload" "/DOutputDir=$output" 'installer/TrayKeeperInstaller.iss'
+
       - name: Upload executable artifacts
         uses: actions/upload-artifact@v4
         with:
           name: TrayKeeper-service-suite
-          path: build/bin/Release/*.exe
+          path: |
+            build/bin/Release/*.exe
+            build/installer-payload/avdb/*.tkavdb
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrayKeeper-antivirus-installer
+          path: build/installer/TrayKeeperAntivirusSetup.exe

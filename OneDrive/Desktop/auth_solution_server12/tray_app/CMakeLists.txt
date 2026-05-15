@@ -28,3 +28,5 @@ if (MSVC)
     target_compile_options(TrayKeeper PRIVATE /W4 /permissive- /utf-8 /wd4828)
     set_source_files_properties("${RPC_CLIENT_STUB}" PROPERTIES COMPILE_OPTIONS "/wd4828")
 endif()
+
+install(TARGETS TrayKeeper RUNTIME DESTINATION .)
