@@ -1,0 +1,9 @@
+[
+    uuid(9f0c7a24-135e-4d33-9e90-872f2e5f8151),
+    version(1.0),
+    implicit_handle(handle_t TrayKeeperControlBinding)
+]
+interface TrayKeeperControl
+{
+    void TrayKeeperStopService();
+}
