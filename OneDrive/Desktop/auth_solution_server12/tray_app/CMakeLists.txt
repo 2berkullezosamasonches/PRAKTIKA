@@ -18,7 +18,7 @@ add_executable(TrayKeeper WIN32
 target_include_directories(TrayKeeper PRIVATE "${RPC_INCLUDE_DIR}")
 target_compile_definitions(TrayKeeper PRIVATE UNICODE _UNICODE)
 
-target_link_libraries(TrayKeeper PRIVATE user32 shell32 gdi32 advapi32 rpcrt4)
+target_link_libraries(TrayKeeper PRIVATE user32 shell32 gdi32 advapi32 rpcrt4 comdlg32 ole32)
 
 set_target_properties(TrayKeeper PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"

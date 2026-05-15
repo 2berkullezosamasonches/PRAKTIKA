@@ -5,29 +5,52 @@
 ]
 interface TrayKeeperControl
 {
+    typedef struct _TK_AUTH_INFO
+    {
+        long authenticated;
+        [string] wchar_t* username;
+    } TK_AUTH_INFO;
+
+    typedef struct _TK_LICENSE_INFO
+    {
+        long active;
+        [string] wchar_t* expiresAt;
+        [string] wchar_t* message;
+    } TK_LICENSE_INFO;
+
+    typedef struct _TK_AV_DATABASE_INFO
+    {
+        long loaded;
+        long recordCount;
+        [string] wchar_t* releaseDate;
+        [string] wchar_t* message;
+    } TK_AV_DATABASE_INFO;
+
+    typedef struct _TK_SCAN_RESULT
+    {
+        long scannedObjects;
+        long infectedObjects;
+        long clean;
+        [string] wchar_t* details;
+    } TK_SCAN_RESULT;
+
+    long TrayKeeperGetCurrentUser([out] TK_AUTH_INFO* info);
+    long TrayKeeperLogin([in, string] wchar_t* username, [in, string] wchar_t* password, [out] TK_AUTH_INFO* info);
+    void TrayKeeperLogout();
+
+    long TrayKeeperGetLicenseInfo([out] TK_LICENSE_INFO* info);
+    long TrayKeeperActivateProduct([in, string] wchar_t* activationCode, [out] TK_LICENSE_INFO* info);
+    long TrayKeeperGetAntivirusState();
+    long TrayKeeperGetAvDatabaseInfo([out] TK_AV_DATABASE_INFO* info);
+    long TrayKeeperScanFile([in, string] wchar_t* path, [out] TK_SCAN_RESULT* result);
+    long TrayKeeperScanDirectory([in, string] wchar_t* path, [out] TK_SCAN_RESULT* result);
+    long TrayKeeperScanFixedDrives([out] TK_SCAN_RESULT* result);
+    long TrayKeeperStartDirectoryMonitor([in, string] wchar_t* path, [out] TK_SCAN_RESULT* result);
+    long TrayKeeperStopDirectoryMonitor([out] TK_SCAN_RESULT* result);
+    long TrayKeeperGetDirectoryMonitorStatus([out] TK_SCAN_RESULT* result);
+    long TrayKeeperStartScheduledDirectoryScan([in, string] wchar_t* path, [in] long intervalSeconds, [out] TK_SCAN_RESULT* result);
+    long TrayKeeperStopScheduledScan([out] TK_SCAN_RESULT* result);
+    long TrayKeeperGetScheduledScanStatus([out] TK_SCAN_RESULT* result);
+
     void TrayKeeperStopService();
-
-    long TrayKeeperGetCurrentUser(
-        [out] long* authenticated,
-        [out, string] wchar_t** username,
-        [out, string] wchar_t** errorMessage);
-
-    long TrayKeeperLogin(
-        [in, string] wchar_t* username,
-        [in, string] wchar_t* password,
-        [out, string] wchar_t** errorMessage);
-
-    long TrayKeeperLogout([out, string] wchar_t** errorMessage);
-
-    long TrayKeeperGetLicenseInfo(
-        [out] long* hasLicense,
-        [out] long* antivirusAllowed,
-        [out, string] wchar_t** endingDate,
-        [out, string] wchar_t** errorMessage);
-
-    long TrayKeeperActivateProduct(
-        [in, string] wchar_t* activationCode,
-        [out, string] wchar_t** errorMessage);
-
-    long TrayKeeperCheckAntivirusAccess([out, string] wchar_t** errorMessage);
 }

@@ -4,14 +4,14 @@ include("${CMAKE_CURRENT_LIST_DIR}/../cmake/TrayKeeperRpc.cmake")
 
 traykeeper_generate_rpc(TrayKeeperService server RPC_INCLUDE_DIR RPC_SERVER_STUB)
 
-add_executable(TrayKeeperService WIN32
+add_executable(TrayKeeperService
     src/main.cpp
     "${RPC_SERVER_STUB}"
 )
 
 target_compile_features(TrayKeeperService PRIVATE cxx_std_17)
 target_include_directories(TrayKeeperService PRIVATE "${RPC_INCLUDE_DIR}")
-target_compile_definitions(TrayKeeperService PRIVATE UNICODE _UNICODE WINVER=0x0601 _WIN32_WINNT=0x0601)
+target_compile_definitions(TrayKeeperService PRIVATE UNICODE _UNICODE)
 
 target_link_libraries(TrayKeeperService PRIVATE
     advapi32
@@ -19,9 +19,6 @@ target_link_libraries(TrayKeeperService PRIVATE
     userenv
     wtsapi32
     winhttp
-    iphlpapi
-    crypt32
-    ws2_32
 )
 
 set_target_properties(TrayKeeperService PROPERTIES
